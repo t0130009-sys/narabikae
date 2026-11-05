@@ -50,7 +50,7 @@
   <div id="list" aria-live="polite"></div>
 
   <p class="note">
-    ファイルはこのブラウザの中だけで処理され、外部には送信されません（外部との通信はブラウザ側で遮断しています）。出力名は <code>元のファイル名_整形.xlsx</code> です。
+    ファイルはこのブラウザの中だけで処理され、外部には送信されません（外部との通信はブラウザ側で遮断しています）。出力名は、中身から判定して <code>中学取り込み用.xlsx</code> / <code>高校取り込み用.xlsx</code> になります（判定できないときは <code>元のファイル名_取り込み用.xlsx</code>）。
     「その他」の学校・塾名と「通塾なし」のコード・名称は空欄になります。
   </p>
 </main>
@@ -334,12 +334,29 @@
   const { transform, DATE_FMT } = window.ReservationList;
   const { readXlsx, parseCsv, writeXlsx } = window.XlsxLite;
 
+  // 中身から中学／高校を判定（学年の列が主。なければイベント名）。判定できなければ null
+  function detectKind(header, rows) {
+    const g = header.indexOf("学年"), e = header.indexOf("イベント名");
+    let mid = 0, high = 0;
+    for (const r of rows) {
+      const v = g >= 0 && r[g] != null ? String(r[g]) : "";
+      if (v.includes("小")) mid++; else if (v.includes("中")) high++;
+    }
+    if (mid === high && e >= 0) for (const r of rows) {
+      const v = r[e] != null ? String(r[e]) : "";
+      if (/中学|中等/.test(v)) mid++; else if (/高校|高等/.test(v)) high++;
+    }
+    return mid > high ? "中学" : high > mid ? "高校" : null;
+  }
+
   async function build(file) {
     const buf = await file.arrayBuffer();
     const aoa = /\.csv$/i.test(file.name) ? parseCsv(buf) : await readXlsx(buf);
     if (!aoa.length) throw new Error("データがありません");
     const { header, rows, extra } = transform(aoa);
-    return { blob: writeXlsx(header, rows, DATE_FMT), name: file.name.replace(/\.[^.]+$/, "") + "_整形.xlsx", count: rows.length, extra };
+    const kind = detectKind(header, rows);
+    const name = (kind ? kind + "取り込み用" : file.name.replace(/\.[^.]+$/, "") + "_取り込み用") + ".xlsx";
+    return { blob: writeXlsx(header, rows, DATE_FMT), name, kind, count: rows.length, extra };
   }
 
   function save(blob, name) {
@@ -357,8 +374,8 @@
     del.onclick = () => el.remove();
     el.append(nm, meta, del); list.prepend(el);
     build(file).then(r => {
-      meta.textContent = r.count + "件 / 追加列 " + r.extra + "列";
-      const b = document.createElement("button"); b.type = "button"; b.textContent = "整形済みExcelをダウンロード";
+      meta.textContent = (r.kind ? r.kind + "・" : "判定できず・") + r.count + "件 / 追加列 " + r.extra + "列 → " + r.name;
+      const b = document.createElement("button"); b.type = "button"; b.textContent = "取り込み用Excelをダウンロード";
       b.onclick = () => save(r.blob, r.name);
       el.insertBefore(b, del);
     }).catch(e => { el.classList.add("err"); meta.textContent = "読み込めませんでした: " + e.message; });
