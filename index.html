@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<!-- 外部への通信を一切許可しない。読み込めるのは同じフォルダのファイルだけ。 -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; img-src data:; form-action 'none'; base-uri 'none'">
+<title>説明会取り込み用ツール</title>
+<style>
+  :root{--bg:#f6f7f9;--fg:#1d2433;--muted:#5f6b7f;--line:#d5dae3;--card:#fff;--accent:#1f5fbf;--ok:#17803d;--err:#b3261e}
+  @media (prefers-color-scheme:dark){:root{--bg:#14171d;--fg:#e8ebf1;--muted:#9aa5b8;--line:#2d3441;--card:#1c2029;--accent:#6aa3ff;--ok:#4cc27a;--err:#ff8a80}}
+  *{box-sizing:border-box}
+  body{margin:0;font:15px/1.7 "Yu Gothic UI","Meiryo UI",system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+  main{max-width:880px;margin:0 auto;padding:32px 16px 64px}
+  h1{font-size:22px;margin:0 0 4px}
+  p.lead{margin:0 0 20px;color:var(--muted)}
+  #drop{border:2px dashed var(--line);border-radius:8px;background:var(--card);padding:40px 16px;text-align:center;cursor:pointer}
+  #drop.over{border-color:var(--accent)}
+  #drop strong{display:block;font-size:17px}
+  #drop span{color:var(--muted);font-size:13px}
+  #list{margin:20px 0 0;display:grid;gap:10px}
+  .item{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:12px 14px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  .item .name{flex:1 1 220px;min-width:0;word-break:break-all}
+  .item .meta{color:var(--muted);font-size:13px;flex:1 1 180px}
+  .item.err .meta{color:var(--err)}
+  button{font:inherit;border:0;border-radius:5px;padding:7px 16px;background:var(--accent);color:#fff;cursor:pointer}
+  button:focus-visible,#drop:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+  .note{margin-top:28px;color:var(--muted);font-size:13px}
+  .note code{background:var(--card);border:1px solid var(--line);border-radius:4px;padding:0 4px}
+</style>
+</head>
+<body>
+<main>
+  <h1>説明会取り込み用ツール</h1>
+  <p class="lead">中学・高校の予約者リスト（Excel / CSV）を、決まった列順のExcelに並べ替えます。</p>
+
+  <div id="drop" tabindex="0" role="button" aria-label="ファイルを選択">
+    <strong>元のExcelをここにドラッグ</strong>
+    <span>またはクリックして選択（複数可・.xlsx / .csv）</span>
+    <input id="file" type="file" accept=".xlsx,.xls,.csv" multiple hidden>
+  </div>
+  <div id="list" aria-live="polite"></div>
+
+  <p class="note">
+    ファイルはこのブラウザの中だけで処理され、外部には送信されません（外部との通信はブラウザ側で遮断しています）。出力名は <code>元のファイル名_整形.xlsx</code> です。
+    「その他」の学校・塾名と「通塾なし」のコード・名称は空欄になります。
+  </p>
+</main>
+<script src="vendor/xlsx.full.min.js"></script>
+<script src="app.js"></script>
+<script>
+(function () {
+  const drop = document.getElementById("drop"), input = document.getElementById("file"), list = document.getElementById("list");
+  const { transform, DATE_FMT } = window.ReservationList;
+  if (typeof XLSX === "undefined") {
+    list.innerHTML = '<div class="item err"><div class="meta">vendor/xlsx.full.min.js がありません。README の手順で配置してください。</div></div>';
+  }
+
+  function build(file, buf) {
+    // cellDates を使わず数値のまま読み、日付書式は出力側で付け直す（時差ズレ防止）
+    const wb = XLSX.read(buf, { type: "array", raw: true });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null, blankrows: false });
+    if (!aoa.length) throw new Error("データがありません");
+    const { header, rows, extra } = transform(aoa);
+    const out = XLSX.utils.aoa_to_sheet([header.map(h => h || null)].concat(rows));
+    header.forEach((h, c) => {
+      if (!DATE_FMT[h]) return;
+      for (let r = 1; r <= rows.length; r++) {
+        const cell = out[XLSX.utils.encode_cell({ r, c })];
+        if (cell && cell.t === "n") cell.z = DATE_FMT[h];
+      }
+    });
+    out["!cols"] = header.map(h => ({ wch: Math.max(10, Math.min(40, (h ? h.length : 4) * 2 + 2)) }));
+    out["!autofilter"] = { ref: out["!ref"] };
+    const book = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(book, out, "予約者リスト");
+    const name = file.name.replace(/\.[^.]+$/, "") + "_整形.xlsx";
+    return { book, name, count: rows.length, extra };
+  }
+
+  function addItem(file) {
+    if (typeof XLSX === "undefined") return;
+    const el = document.createElement("div"); el.className = "item";
+    const nm = document.createElement("div"); nm.className = "name"; nm.textContent = file.name;
+    const meta = document.createElement("div"); meta.className = "meta"; meta.textContent = "変換中…";
+    el.append(nm, meta); list.prepend(el);
+    file.arrayBuffer().then(buf => {
+      const r = build(file, buf);
+      meta.textContent = r.count + "件 / 追加列 " + r.extra + "列";
+      const b = document.createElement("button"); b.type = "button"; b.textContent = "整形済みExcelをダウンロード";
+      b.onclick = () => XLSX.writeFile(r.book, r.name);
+      el.append(b);
+    }).catch(e => { el.classList.add("err"); meta.textContent = "読み込めませんでした: " + e.message; });
+  }
+
+  const take = files => Array.from(files).forEach(addItem);
+  drop.addEventListener("click", () => input.click());
+  drop.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); } });
+  input.addEventListener("change", () => { take(input.files); input.value = ""; });
+  ["dragenter", "dragover"].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add("over"); }));
+  ["dragleave", "drop"].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.remove("over"); }));
+  drop.addEventListener("drop", e => take(e.dataTransfer.files));
+  window.addEventListener("dragover", e => e.preventDefault());
+  window.addEventListener("drop", e => e.preventDefault());
+})();
+</script>
+</body>
+</html>
