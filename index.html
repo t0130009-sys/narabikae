@@ -20,6 +20,8 @@
   #drop span{color:var(--muted);font-size:13px}
   #list{margin:20px 0 0;display:grid;gap:10px}
   #pick{margin-top:12px;background:var(--card);color:var(--accent);border:1px solid var(--accent)}
+  .del{background:transparent;color:var(--muted);border:1px solid var(--line)}
+  #clearRow{margin:16px 0 0;text-align:right}
   .status{margin:12px 0 0;color:var(--muted);font-size:13px}
   .status.err{color:var(--err)}
   .item{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:12px 14px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
@@ -44,6 +46,7 @@
   </div>
   <p><button type="button" id="pick">ファイルを選択して読み込む</button></p>
   <p id="status" class="status" aria-live="polite">読み込み中…（この表示が変わらない場合は、JavaScriptが動いていません）</p>
+  <p id="clearRow" hidden><button type="button" class="del" id="clear">すべて削除</button></p>
   <div id="list" aria-live="polite"></div>
 
   <p class="note">
@@ -349,12 +352,15 @@
     const el = document.createElement("div"); el.className = "item";
     const nm = document.createElement("div"); nm.className = "name"; nm.textContent = file.name;
     const meta = document.createElement("div"); meta.className = "meta"; meta.textContent = "変換中…";
-    el.append(nm, meta); list.prepend(el);
+    const del = document.createElement("button"); del.type = "button"; del.className = "del"; del.textContent = "削除";
+    del.setAttribute("aria-label", file.name + " を一覧から削除");
+    del.onclick = () => el.remove();
+    el.append(nm, meta, del); list.prepend(el);
     build(file).then(r => {
       meta.textContent = r.count + "件 / 追加列 " + r.extra + "列";
       const b = document.createElement("button"); b.type = "button"; b.textContent = "整形済みExcelをダウンロード";
       b.onclick = () => save(r.blob, r.name);
-      el.append(b);
+      el.insertBefore(b, del);
     }).catch(e => { el.classList.add("err"); meta.textContent = "読み込めませんでした: " + e.message; });
   }
 
@@ -374,6 +380,10 @@
     status.textContent = files.length + "件のファイルを受け取りました";
     Array.from(files).forEach(addItem);
   };
+  const clearRow = document.getElementById("clearRow");
+  const refreshClear = () => { clearRow.hidden = list.children.length < 2; };
+  new MutationObserver(refreshClear).observe(list, { childList: true });
+  document.getElementById("clear").addEventListener("click", () => { list.innerHTML = ""; status.className = "status"; status.textContent = "準備OK：ファイルをドロップできます"; });
   const pick = () => input.click();
   drop.addEventListener("click", pick);
   document.getElementById("pick").addEventListener("click", pick);
