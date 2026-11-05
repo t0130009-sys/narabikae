@@ -46,63 +46,54 @@
     「その他」の学校・塾名と「通塾なし」のコード・名称は空欄になります。
   </p>
 </main>
-<script src="vendor/xlsx.full.min.js"></script>
 <script src="app.js"></script>
+<script src="xlsx-lite.js"></script>
 <script>
 (function () {
   const drop = document.getElementById("drop"), input = document.getElementById("file"), list = document.getElementById("list");
   const { transform, DATE_FMT } = window.ReservationList;
-  if (typeof XLSX === "undefined") {
-    list.innerHTML = '<div class="item err"><div class="meta">vendor/xlsx.full.min.js がありません。README の手順で配置してください。</div></div>';
-  }
+  const { readXlsx, parseCsv, writeXlsx } = window.XlsxLite;
 
-  function build(file, buf) {
-    // cellDates を使わず数値のまま読み、日付書式は出力側で付け直す（時差ズレ防止）
-    const wb = XLSX.read(buf, { type: "array", raw: true });
-    const ws = wb.Sheets[wb.SheetNames[0]];
-    const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null, blankrows: false });
+  async function build(file) {
+    const buf = await file.arrayBuffer();
+    const aoa = /\.csv$/i.test(file.name) ? parseCsv(buf) : await readXlsx(buf);
     if (!aoa.length) throw new Error("データがありません");
     const { header, rows, extra } = transform(aoa);
-    const out = XLSX.utils.aoa_to_sheet([header.map(h => h || null)].concat(rows));
-    header.forEach((h, c) => {
-      if (!DATE_FMT[h]) return;
-      for (let r = 1; r <= rows.length; r++) {
-        const cell = out[XLSX.utils.encode_cell({ r, c })];
-        if (cell && cell.t === "n") cell.z = DATE_FMT[h];
-      }
-    });
-    out["!cols"] = header.map(h => ({ wch: Math.max(10, Math.min(40, (h ? h.length : 4) * 2 + 2)) }));
-    out["!autofilter"] = { ref: out["!ref"] };
-    const book = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(book, out, "予約者リスト");
-    const name = file.name.replace(/\.[^.]+$/, "") + "_整形.xlsx";
-    return { book, name, count: rows.length, extra };
+    return { blob: writeXlsx(header, rows, DATE_FMT), name: file.name.replace(/\.[^.]+$/, "") + "_整形.xlsx", count: rows.length, extra };
+  }
+
+  function save(blob, name) {
+    const url = URL.createObjectURL(blob), a = document.createElement("a");
+    a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
   }
 
   function addItem(file) {
-    if (typeof XLSX === "undefined") return;
     const el = document.createElement("div"); el.className = "item";
     const nm = document.createElement("div"); nm.className = "name"; nm.textContent = file.name;
     const meta = document.createElement("div"); meta.className = "meta"; meta.textContent = "変換中…";
     el.append(nm, meta); list.prepend(el);
-    file.arrayBuffer().then(buf => {
-      const r = build(file, buf);
+    build(file).then(r => {
       meta.textContent = r.count + "件 / 追加列 " + r.extra + "列";
       const b = document.createElement("button"); b.type = "button"; b.textContent = "整形済みExcelをダウンロード";
-      b.onclick = () => XLSX.writeFile(r.book, r.name);
+      b.onclick = () => save(r.blob, r.name);
       el.append(b);
     }).catch(e => { el.classList.add("err"); meta.textContent = "読み込めませんでした: " + e.message; });
   }
 
-  const take = files => Array.from(files).forEach(addItem);
+  const take = files => {
+    if (!files || !files.length) { list.innerHTML = '<div class="item err"><div class="meta">ファイルを受け取れませんでした。クリックして選択してください。</div></div>'; return; }
+    Array.from(files).forEach(addItem);
+  };
   drop.addEventListener("click", () => input.click());
   drop.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); } });
   input.addEventListener("change", () => { take(input.files); input.value = ""; });
   ["dragenter", "dragover"].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add("over"); }));
-  ["dragleave", "drop"].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.remove("over"); }));
-  drop.addEventListener("drop", e => take(e.dataTransfer.files));
+  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+  drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); take(e.dataTransfer.files); });
+  // ドロップ位置が枠の外でも、ブラウザがファイルを開いてしまわないようにする
   window.addEventListener("dragover", e => e.preventDefault());
-  window.addEventListener("drop", e => e.preventDefault());
+  window.addEventListener("drop", e => { e.preventDefault(); if (!drop.contains(e.target)) take(e.dataTransfer.files); });
 })();
 </script>
 </body>
