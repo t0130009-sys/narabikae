@@ -19,6 +19,7 @@
   #drop strong{display:block;font-size:17px}
   #drop span{color:var(--muted);font-size:13px}
   #list{margin:20px 0 0;display:grid;gap:10px}
+  #pick{margin-top:12px;background:var(--card);color:var(--accent);border:1px solid var(--accent)}
   .status{margin:12px 0 0;color:var(--muted);font-size:13px}
   .status.err{color:var(--err)}
   .item{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:12px 14px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
@@ -41,6 +42,7 @@
     <span>またはクリックして選択（複数可・.xlsx / .csv）</span>
     <input id="file" type="file" accept=".xlsx,.xls,.csv" multiple hidden>
   </div>
+  <p><button type="button" id="pick">ファイルを選択して読み込む</button></p>
   <p id="status" class="status" aria-live="polite">読み込み中…（この表示が変わらない場合は、JavaScriptが動いていません）</p>
   <div id="list" aria-live="polite"></div>
 
@@ -361,20 +363,30 @@
   function fail(msg) { status.textContent = msg; status.className = "status err"; }
   window.addEventListener("error", e => fail("エラー: " + e.message));
   window.addEventListener("unhandledrejection", e => fail("エラー: " + (e.reason && e.reason.message || e.reason)));
+  function filesFrom(dt) {
+    let f = Array.from((dt && dt.files) || []);
+    if (!f.length && dt && dt.items) f = Array.from(dt.items).filter(i => i.kind === "file").map(i => i.getAsFile()).filter(Boolean);
+    return f;
+  }
   const take = files => {
-    if (!files || !files.length) { list.innerHTML = '<div class="item err"><div class="meta">ファイルを受け取れませんでした。クリックして選択してください。</div></div>'; return; }
+    if (!files || !files.length) { fail("ファイルを受け取れませんでした。エクスプローラー／Finderからファイルそのものをドラッグするか、「ファイルを選択して読み込む」を押してください。"); return; }
+    status.className = "status";
     status.textContent = files.length + "件のファイルを受け取りました";
     Array.from(files).forEach(addItem);
   };
-  drop.addEventListener("click", () => input.click());
-  drop.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); } });
-  input.addEventListener("change", () => { take(input.files); input.value = ""; });
-  ["dragenter", "dragover"].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add("over"); }));
-  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
-  drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); take(e.dataTransfer.files); });
-  // ドロップ位置が枠の外でも、ブラウザがファイルを開いてしまわないようにする
-  window.addEventListener("dragover", e => e.preventDefault());
-  window.addEventListener("drop", e => { e.preventDefault(); if (!drop.contains(e.target)) take(e.dataTransfer.files); });
+  const pick = () => input.click();
+  drop.addEventListener("click", pick);
+  document.getElementById("pick").addEventListener("click", pick);
+  drop.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } });
+  input.addEventListener("change", () => { take(filesFrom(input)); input.value = ""; });
+  // ページのどこにドロップしても受け取る（外すとブラウザがファイルを開いてしまうため）
+  ["dragenter", "dragover"].forEach(t => window.addEventListener(t, e => {
+    e.preventDefault(); drop.classList.add("over");
+    status.className = "status"; status.textContent = "ドロップを検出しました。マウスを離してください";
+  }));
+  window.addEventListener("dragleave", e => { if (!e.relatedTarget) { drop.classList.remove("over"); status.textContent = "準備OK：ファイルをドロップできます"; } });
+  window.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); take(filesFrom(e.dataTransfer)); });
+  window.addEventListener("paste", e => { const f = filesFrom(e.clipboardData); if (f.length) take(f); });
 })();
 </script>
 </body>
