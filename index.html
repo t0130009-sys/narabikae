@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <!-- 外部への通信を一切許可しない。読み込めるのは同じフォルダのファイルだけ。 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; img-src data:; form-action 'none'; base-uri 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; img-src data:; form-action 'none'; base-uri 'none'">
 <title>説明会取り込み用ツール</title>
 <style>
   :root{--bg:#f6f7f9;--fg:#1d2433;--muted:#5f6b7f;--line:#d5dae3;--card:#fff;--accent:#1f5fbf;--ok:#17803d;--err:#b3261e}
@@ -19,6 +19,8 @@
   #drop strong{display:block;font-size:17px}
   #drop span{color:var(--muted);font-size:13px}
   #list{margin:20px 0 0;display:grid;gap:10px}
+  .status{margin:12px 0 0;color:var(--muted);font-size:13px}
+  .status.err{color:var(--err)}
   .item{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:12px 14px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
   .item .name{flex:1 1 220px;min-width:0;word-break:break-all}
   .item .meta{color:var(--muted);font-size:13px;flex:1 1 180px}
@@ -39,6 +41,7 @@
     <span>またはクリックして選択（複数可・.xlsx / .csv）</span>
     <input id="file" type="file" accept=".xlsx,.xls,.csv" multiple hidden>
   </div>
+  <p id="status" class="status" aria-live="polite">読み込み中…（この表示が変わらない場合は、JavaScriptが動いていません）</p>
   <div id="list" aria-live="polite"></div>
 
   <p class="note">
@@ -46,8 +49,280 @@
     「その他」の学校・塾名と「通塾なし」のコード・名称は空欄になります。
   </p>
 </main>
-<script src="app.js"></script>
-<script src="xlsx-lite.js"></script>
+<script>
+/* 説明会取り込み用ツール 整形ロジック（ブラウザ / Node 共通）。python/make_list.py と同じ仕様。 */
+(function (root) {
+  const ORDER = ["年度","イベント申込番号","ログインユーザSEQ","ログインメールアドレス","申込時メールアドレス",
+    "受験生SEQ","イベント名","イベント種類","イベント区分","開催日(From)","開催日(To)","イベント開始時間",
+    "イベント終了時間","申込完了日","申込件数","申込人数（受験生）","申込人数（保護者等）",
+    "参加人数（受験生）","参加人数（保護者等）","キャンセル","キャンセル日",
+    "お子様氏名(漢字)（姓）","お子様氏名(漢字)（名）","お子様氏名(カナ)（姓）","お子様氏名(カナ)（名）",
+    "性別","生年月日","郵便番号","都道府県","市区町村","町名・番地","建物名・部屋番号","電話番号",
+    "塾コード","塾名称","塾名称その他","学年",
+    "", "", "",                                   // 学年の後ろの空き列3つ
+    "出身校コード","出身校名称","出身校名称その他"];
+
+  // 出力名 -> 入力ファイル側の名前
+  const ALIAS = {
+    "申込人数（受験生）":"申込人数合計（受験生）","申込人数（保護者等）":"申込人数合計（保護者等）",
+    "参加人数（受験生）":"参加人数合計（受験生）","参加人数（保護者等）":"参加人数合計（保護者等）",
+    "お子様氏名(漢字)（姓）":"氏名(漢字)（姓）","お子様氏名(漢字)（名）":"氏名(漢字)（名）",
+    "お子様氏名(カナ)（姓）":"氏名(カナ)（姓）","お子様氏名(カナ)（名）":"氏名(カナ)（名）"};
+
+  // Excel上の日付書式（数値で入っている場合のみ適用）
+  const DATE_FMT = {"開催日(From)":"yyyy/mm/dd","開催日(To)":"yyyy/mm/dd","キャンセル日":"yyyy/mm/dd",
+                    "申込完了日":"yyyy/mm/dd hh:mm:ss"};
+
+  const isStr = v => typeof v === "string";
+
+  // 50音順（濁点・半濁点を無視。同じ読みなら 清音→濁点→半濁点）
+  const SMALL = {"ァ":"ア","ィ":"イ","ゥ":"ウ","ェ":"エ","ォ":"オ","ッ":"ツ","ャ":"ヤ","ュ":"ユ","ョ":"ヨ","ヮ":"ワ","ヵ":"カ","ヶ":"ケ"};
+  function kanaKey(v) {
+    if (v == null || String(v).trim() === "") return null;
+    let s = String(v).normalize("NFKC").replace(/[ぁ-ゖ]/g, c => String.fromCharCode(c.charCodeAt(0) + 0x60)).replace(/[ \u3000]/g, "");
+    let base = "", marks = "";
+    for (const c of s.normalize("NFD")) {
+      if (c === "\u3099" && marks) marks = marks.slice(0, -1) + "1";
+      else if (c === "\u309a" && marks) marks = marks.slice(0, -1) + "2";
+      else { base += SMALL[c] || c; marks += "0"; }
+    }
+    return [base, marks];
+  }
+  function cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
+  function sortKey(d) {
+    const last = ["\uffff", ""];
+    const sei = kanaKey(d["氏名(カナ)（姓）"]) || last, mei = kanaKey(d["氏名(カナ)（名）"]) || last;
+    return [sei[0], mei[0], sei[1], mei[1]];
+  }
+  function compareRows(x, y) {
+    const a = sortKey(x), b = sortKey(y);
+    for (let i = 0; i < 4; i++) { const c = cmp(a[i], b[i]); if (c) return c; }
+    return 0;
+  }
+
+  /** aoa: 1行目が見出しの2次元配列 -> {header, rows, extra} */
+  function transform(aoa) {
+    const head = (aoa[0] || []).map(h => (h == null ? "" : String(h).trim()));
+    const data = [];
+    for (const r of aoa.slice(1)) {
+      const cells = head.map((_, i) => (r[i] === "" || r[i] === undefined ? null : r[i]));
+      if (cells.every(v => v === null)) continue;                // 空行は捨てる
+      const d = {}; head.forEach((h, i) => { if (h) d[h] = cells[i]; });
+      data.push(d);
+    }
+    const pairs = [["出身校コード","出身校名称"],["塾コード","塾名称"]];
+    head.forEach(h => { if (/^併願校\d+名称$/.test(h)) pairs.push([h.replace("名称","コード"), h]); });
+    for (const d of data) {
+      for (const [code, name] of pairs)                          // 「その他」→ コード・名称を空に
+        if (isStr(d[name]) && d[name].trim().startsWith("その他")) { d[code] = null; d[name] = null; }
+      if (isStr(d["塾名称"]) && d["塾名称"].trim() === "通塾なし") { // 通塾なし → 塾コード・塾名称を空に
+        d["塾コード"] = null; d["塾名称"] = null;
+      }
+    }
+    data.sort(compareRows);                                      // 姓→名の50音順（同順位は元の順。Array.sort は安定）
+    const used = new Set(ORDER.filter(Boolean).map(h => ALIAS[h] || h));
+    const rest = head.filter(h => h && !used.has(h));            // 載っていない欄は最後（元の順）
+    const header = ORDER.concat(rest);
+    const rows = data.map(d => header.map(h => (h ? (d[ALIAS[h] || h] ?? null) : null)));
+    return { header, rows, extra: rest.length };
+  }
+
+  const api = { transform, ORDER, ALIAS, DATE_FMT };
+  if (typeof module !== "undefined" && module.exports) module.exports = api; else root.ReservationList = api;
+})(typeof window !== "undefined" ? window : globalThis);
+
+</script>
+<script>
+/* 外部ライブラリなしで xlsx を読み書きする最小実装（ブラウザ標準の機能だけを使用）。
+   読み込み: 先頭シートの値（文字・数値）。書き込み: 1シート、見出し装飾・行固定・フィルター付き。 */
+(function (root) {
+  const td = new TextDecoder("utf-8"), te = new TextEncoder();
+  const NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
+  // ---------- zip 読み込み ----------
+  async function inflateRaw(u8) {
+    if (typeof DecompressionStream === "undefined") throw new Error("このブラウザは非対応です（Chrome / Edge / Safari / Firefox の最新版を使ってください）");
+    const s = new Blob([u8]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+    return new Uint8Array(await new Response(s).arrayBuffer());
+  }
+  async function unzip(buf) {
+    const u8 = new Uint8Array(buf), dv = new DataView(buf);
+    if (u8.length > 4 && dv.getUint32(0, true) === 0xE011CFD0) throw new Error("古い形式（.xls）です。Excelで .xlsx として保存し直してください");
+    let eocd = -1;
+    for (let i = u8.length - 22; i >= Math.max(0, u8.length - 65557); i--) if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    if (eocd < 0) throw new Error("xlsx ファイルとして読めませんでした");
+    const n = dv.getUint16(eocd + 10, true); let p = dv.getUint32(eocd + 16, true);
+    const files = {};
+    for (let k = 0; k < n; k++) {
+      if (dv.getUint32(p, true) !== 0x02014b50) throw new Error("xlsx の構造が壊れています");
+      const method = dv.getUint16(p + 10, true), csize = dv.getUint32(p + 20, true);
+      const nlen = dv.getUint16(p + 28, true), elen = dv.getUint16(p + 30, true), clen = dv.getUint16(p + 32, true), off = dv.getUint32(p + 42, true);
+      files[td.decode(u8.subarray(p + 46, p + 46 + nlen))] = { method, csize, off };
+      p += 46 + nlen + elen + clen;
+    }
+    return {
+      async text(name) {
+        const f = files[name]; if (!f) return null;
+        const ln = dv.getUint16(f.off + 26, true), le = dv.getUint16(f.off + 28, true), st = f.off + 30 + ln + le;
+        const data = u8.subarray(st, st + f.csize);
+        if (f.method === 0) return td.decode(data);
+        if (f.method === 8) return td.decode(await inflateRaw(data));
+        throw new Error("未対応の圧縮方式です");
+      }
+    };
+  }
+
+  // ---------- xlsx 読み込み ----------
+  const parseXml = s => new DOMParser().parseFromString(s, "application/xml");
+  const els = (n, name) => Array.from(n.getElementsByTagNameNS("*", name));
+  function richText(si) {                       // <t> と <r><t> を連結。ふりがな(rPh)は除く
+    let out = "";
+    for (const c of Array.from(si.children)) {
+      if (c.localName === "t") out += c.textContent;
+      else if (c.localName === "r") for (const t of els(c, "t")) out += t.textContent;
+    }
+    return out;
+  }
+  function colIndex(ref) {
+    let n = 0; for (const ch of ref.replace(/\d+/g, "")) n = n * 26 + (ch.charCodeAt(0) - 64);
+    return n - 1;
+  }
+  async function readXlsx(buf) {
+    const z = await unzip(buf);
+    const wb = await z.text("xl/workbook.xml");
+    if (!wb) throw new Error("xlsx ファイルとして読めませんでした");
+    let path = "xl/worksheets/sheet1.xml";
+    const sheet = els(parseXml(wb), "sheet")[0], rid = sheet && sheet.getAttributeNS(NS_R, "id");
+    const rels = await z.text("xl/_rels/workbook.xml.rels");
+    if (rid && rels) {
+      const rel = els(parseXml(rels), "Relationship").find(r => r.getAttribute("Id") === rid);
+      if (rel) { const t = rel.getAttribute("Target"); path = t.startsWith("/") ? t.slice(1) : "xl/" + t; }
+    }
+    const sstXml = await z.text("xl/sharedStrings.xml");
+    const sst = sstXml ? els(parseXml(sstXml), "si").map(richText) : [];
+    const sx = await z.text(path);
+    if (!sx) throw new Error("シートが見つかりません");
+    const rows = [];
+    for (const row of els(parseXml(sx), "row")) {
+      const ri = row.getAttribute("r") ? Number(row.getAttribute("r")) - 1 : rows.length;
+      const out = rows[ri] || (rows[ri] = []);
+      let ci = 0;
+      for (const c of Array.from(row.children).filter(e => e.localName === "c")) {
+        if (c.getAttribute("r")) ci = colIndex(c.getAttribute("r"));
+        const t = c.getAttribute("t"), vEl = c.getElementsByTagNameNS("*", "v")[0], v = vEl ? vEl.textContent : null;
+        let val = null;
+        if (t === "inlineStr") val = els(c, "is").map(richText).join("");
+        else if (v === null) val = null;
+        else if (t === "s") val = sst[Number(v)] ?? null;
+        else if (t === "str") val = v;
+        else if (t === "b") val = v === "1";
+        else if (t === "e") val = null;
+        else val = v === "" ? null : Number(v);
+        out[ci] = val; ci++;
+      }
+    }
+    for (let i = 0; i < rows.length; i++) if (!rows[i]) rows[i] = [];
+    return rows;
+  }
+
+  // ---------- CSV 読み込み ----------
+  function parseCsv(buf) {
+    let text = td.decode(buf);
+    if (text.includes("\uFFFD")) { try { text = new TextDecoder("shift_jis").decode(buf); } catch (e) {} }
+    text = text.replace(/^﻿/, "");
+    const rows = []; let row = [], cur = "", q = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (q) { if (ch === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += ch; }
+      else if (ch === '"') q = true;
+      else if (ch === ",") { row.push(cur); cur = ""; }
+      else if (ch === "\n" || ch === "\r") { if (ch === "\r" && text[i + 1] === "\n") i++; row.push(cur); rows.push(row); row = []; cur = ""; }
+      else cur += ch;
+    }
+    if (cur !== "" || row.length) { row.push(cur); rows.push(row); }
+    return rows;
+  }
+
+  // ---------- zip 書き込み（無圧縮） ----------
+  const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+  function crc32(u8) { let c = 0xFFFFFFFF; for (let i = 0; i < u8.length; i++) c = CRC[(c ^ u8[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+  function zip(entries) {                        // [{name, data(Uint8Array)}]
+    const parts = [], central = []; let off = 0;
+    const u16 = v => { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, v, true); return b; };
+    const u32 = v => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v >>> 0, true); return b; };
+    const cat = (...a) => { const o = new Uint8Array(a.reduce((s, x) => s + x.length, 0)); let p = 0; for (const x of a) { o.set(x, p); p += x.length; } return o; };
+    for (const e of entries) {
+      const name = te.encode(e.name), crc = crc32(e.data);
+      const local = cat(u32(0x04034b50), u16(20), u16(0x0800), u16(0), u16(0), u16(0x21), u32(crc), u32(e.data.length), u32(e.data.length), u16(name.length), u16(0), name);
+      central.push(cat(u32(0x02014b50), u16(20), u16(20), u16(0x0800), u16(0), u16(0), u16(0x21), u32(crc), u32(e.data.length), u32(e.data.length), u16(name.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(off), name));
+      parts.push(local, e.data); off += local.length + e.data.length;
+    }
+    const cd = cat(...central);
+    parts.push(cd, cat(u32(0x06054b50), u16(0), u16(0), u16(entries.length), u16(entries.length), u32(cd.length), u32(off), u16(0)));
+    return new Blob(parts, { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  }
+
+  // ---------- xlsx 書き込み ----------
+  const esc = s => String(s).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  function colName(i) { let s = ""; for (i++; i > 0; i = Math.floor((i - 1) / 26)) s = String.fromCharCode(65 + (i - 1) % 26) + s; return s; }
+  const XH = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
+  const MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+
+  /** header: 見出し配列, rows: 値の2次元配列, dateFmt: {見出し名: "yyyy/mm/dd" など}（数値セルに適用） */
+  function writeXlsx(header, rows, dateFmt, sheetName) {
+    dateFmt = dateFmt || {};
+    const fmts = Array.from(new Set(Object.values(dateFmt)));          // numFmt id = 164 + index
+    const fmtXf = f => 2 + fmts.indexOf(f);                             // cellXfs: 0 通常, 1 見出し, 2.. 日付
+    let sd = "";
+    const widths = header.map((h, c) => {
+      let w = h ? h.length : 4;
+      for (const r of rows) { const v = r[c]; if (v !== null && v !== undefined) w = Math.max(w, String(v).length); }
+      return Math.min(Math.max(w * 1.6 + 2, 10), 40);
+    });
+    sd += '<row r="1" ht="22" customHeight="1">' + header.map((h, c) => h ? `<c r="${colName(c)}1" s="1" t="inlineStr"><is><t xml:space="preserve">${esc(h)}</t></is></c>` : "").join("") + "</row>";
+    rows.forEach((r, i) => {
+      let cells = "";
+      header.forEach((h, c) => {
+        const v = r[c]; if (v === null || v === undefined || v === "") return;
+        const ref = colName(c) + (i + 2);
+        if (typeof v === "number" && isFinite(v)) cells += `<c r="${ref}"${dateFmt[h] ? ` s="${fmtXf(dateFmt[h])}"` : ""}><v>${v}</v></c>`;
+        else if (typeof v === "boolean") cells += `<c r="${ref}" t="b"><v>${v ? 1 : 0}</v></c>`;
+        else cells += `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${esc(v)}</t></is></c>`;
+      });
+      sd += `<row r="${i + 2}">${cells}</row>`;
+    });
+    const last = colName(header.length - 1) + (rows.length + 1);
+    const sheet = XH + `<worksheet xmlns="${MAIN}"><dimension ref="A1:${last}"/>` +
+      '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>' +
+      '<sheetFormatPr defaultRowHeight="15"/><cols>' + widths.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w.toFixed(1)}" customWidth="1"/>`).join("") + "</cols>" +
+      `<sheetData>${sd}</sheetData><autoFilter ref="A1:${last}"/></worksheet>`;
+    const styles = XH + `<styleSheet xmlns="${MAIN}">` +
+      (fmts.length ? `<numFmts count="${fmts.length}">` + fmts.map((f, i) => `<numFmt numFmtId="${164 + i}" formatCode="${esc(f)}"/>`).join("") + "</numFmts>" : "") +
+      '<fonts count="2"><font><sz val="10"/><name val="Meiryo UI"/></font><font><b/><sz val="10"/><name val="Meiryo UI"/></font></fonts>' +
+      '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFD9E1F2"/><bgColor indexed="64"/></patternFill></fill></fills>' +
+      '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>' +
+      '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
+      `<cellXfs count="${2 + fmts.length}"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyFont="1"/>` +
+      '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>' +
+      fmts.map((f, i) => `<xf numFmtId="${164 + i}" fontId="0" fillId="0" borderId="0" xfId="0" applyFont="1" applyNumberFormat="1"/>`).join("") +
+      '</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>';
+    const R = "http://schemas.openxmlformats.org/package/2006/relationships";
+    const enc = s => te.encode(s);
+    return zip([
+      { name: "[Content_Types].xml", data: enc(XH + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>') },
+      { name: "_rels/.rels", data: enc(XH + `<Relationships xmlns="${R}"><Relationship Id="rId1" Type="${NS_R}/officeDocument" Target="xl/workbook.xml"/></Relationships>`) },
+      { name: "xl/workbook.xml", data: enc(XH + `<workbook xmlns="${MAIN}" xmlns:r="${NS_R}"><sheets><sheet name="${esc(sheetName || "予約者リスト")}" sheetId="1" r:id="rId1"/></sheets></workbook>`) },
+      { name: "xl/_rels/workbook.xml.rels", data: enc(XH + `<Relationships xmlns="${R}"><Relationship Id="rId1" Type="${NS_R}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="${NS_R}/styles" Target="styles.xml"/></Relationships>`) },
+      { name: "xl/styles.xml", data: enc(styles) },
+      { name: "xl/worksheets/sheet1.xml", data: enc(sheet) }
+    ]);
+  }
+
+  const api = { readXlsx, parseCsv, writeXlsx };
+  if (typeof module !== "undefined" && module.exports) module.exports = api; else root.XlsxLite = api;
+})(typeof window !== "undefined" ? window : globalThis);
+
+</script>
 <script>
 (function () {
   const drop = document.getElementById("drop"), input = document.getElementById("file"), list = document.getElementById("list");
@@ -81,8 +356,14 @@
     }).catch(e => { el.classList.add("err"); meta.textContent = "読み込めませんでした: " + e.message; });
   }
 
+  const status = document.getElementById("status");
+  status.textContent = "準備OK：ファイルをドロップできます";
+  function fail(msg) { status.textContent = msg; status.className = "status err"; }
+  window.addEventListener("error", e => fail("エラー: " + e.message));
+  window.addEventListener("unhandledrejection", e => fail("エラー: " + (e.reason && e.reason.message || e.reason)));
   const take = files => {
     if (!files || !files.length) { list.innerHTML = '<div class="item err"><div class="meta">ファイルを受け取れませんでした。クリックして選択してください。</div></div>'; return; }
+    status.textContent = files.length + "件のファイルを受け取りました";
     Array.from(files).forEach(addItem);
   };
   drop.addEventListener("click", () => input.click());
