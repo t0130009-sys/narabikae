@@ -105,10 +105,36 @@
     return 0;
   }
 
+  // 同じ人の判定: カナ姓＋カナ名＋生年月日。申込完了日が一番新しい1件だけ残す
+  function personKey(d) {
+    const n = v => v == null ? "" : String(v).normalize("NFKC").replace(/[ぁ-ゖ]/g, c => String.fromCharCode(c.charCodeAt(0) + 0x60)).replace(/[\s\u3000]/g, "");
+    const sei = n(d["氏名(カナ)（姓）"]), mei = n(d["氏名(カナ)（名）"]);
+    if (!sei && !mei) return null;                               // 名前が空の行は同一人物と判定できないので残す
+    const birth = d["生年月日"] == null ? "" : String(d["生年月日"]).normalize("NFKC").replace(/[^0-9]/g, "");
+    return sei + "|" + mei + "|" + birth;
+  }
+  function timeOf(v) {                                           // xlsxの日付(数値) / 文字列の日時 → 比較用の数値
+    if (typeof v === "number") return v;
+    if (typeof v === "string") { const t = Date.parse(v.trim().replace(/-/g, "/")); if (!isNaN(t)) return t / 86400000 + 25569; }
+    return -Infinity;
+  }
+  function dedupeLatest(data) {
+    const best = new Map(), keep = new Set();
+    data.forEach((d, i) => {
+      const k = personKey(d);
+      if (k === null) { keep.add(i); return; }
+      const cur = best.get(k);
+      // 新しい方を残す。同時刻・日付なしの同士は、ファイルの後ろの行を残す
+      if (cur === undefined || timeOf(d["申込完了日"]) >= timeOf(data[cur]["申込完了日"])) best.set(k, i);
+    });
+    best.forEach(i => keep.add(i));
+    return data.filter((_, i) => keep.has(i));
+  }
+
   /** aoa: 1行目が見出しの2次元配列 -> {header, rows, extra} */
   function transform(aoa) {
     const head = (aoa[0] || []).map(h => (h == null ? "" : String(h).trim()));
-    const data = [];
+    let data = [];
     for (const r of aoa.slice(1)) {
       const cells = head.map((_, i) => (r[i] === "" || r[i] === undefined ? null : r[i]));
       if (cells.every(v => v === null)) continue;                // 空行は捨てる
@@ -124,12 +150,15 @@
         d["塾コード"] = null; d["塾名称"] = null;
       }
     }
+    const before = data.length;
+    data = dedupeLatest(data);                                   // 同じ人が複数申込 → 最新だけ
+    const removed = before - data.length;
     data.sort(compareRows);                                      // 姓→名の50音順（同順位は元の順。Array.sort は安定）
     const used = new Set(ORDER.filter(Boolean).map(h => ALIAS[h] || h));
     const rest = head.filter(h => h && !used.has(h));            // 載っていない欄は最後（元の順）
     const header = ORDER.concat(rest);
     const rows = data.map(d => header.map(h => (h ? (d[ALIAS[h] || h] ?? null) : null)));
-    return { header, rows, extra: rest.length };
+    return { header, rows, extra: rest.length, removed };
   }
 
   const api = { transform, ORDER, ALIAS, DATE_FMT };
@@ -353,10 +382,10 @@
     const buf = await file.arrayBuffer();
     const aoa = /\.csv$/i.test(file.name) ? parseCsv(buf) : await readXlsx(buf);
     if (!aoa.length) throw new Error("データがありません");
-    const { header, rows, extra } = transform(aoa);
+    const { header, rows, extra, removed } = transform(aoa);
     const kind = detectKind(header, rows);
     const name = (kind ? kind + "取り込み用" : file.name.replace(/\.[^.]+$/, "") + "_取り込み用") + ".xlsx";
-    return { blob: writeXlsx(header, rows, DATE_FMT), name, kind, count: rows.length, extra };
+    return { blob: writeXlsx(header, rows, DATE_FMT), name, kind, count: rows.length, extra, removed };
   }
 
   function save(blob, name) {
@@ -374,7 +403,7 @@
     del.onclick = () => el.remove();
     el.append(nm, meta, del); list.prepend(el);
     build(file).then(r => {
-      meta.textContent = (r.kind ? r.kind + "・" : "判定できず・") + r.count + "件 / 追加列 " + r.extra + "列 → " + r.name;
+      meta.textContent = (r.kind ? r.kind + "・" : "判定できず・") + r.count + "件" + (r.removed ? "（重複" + r.removed + "件を除外）" : "") + " / 追加列 " + r.extra + "列 → " + r.name;
       const b = document.createElement("button"); b.type = "button"; b.textContent = "取り込み用Excelをダウンロード";
       b.onclick = () => save(r.blob, r.name);
       el.insertBefore(b, del);
